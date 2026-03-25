@@ -64,10 +64,14 @@ def _make_message(user_id: int, chat_id: int, thread_id: int | None = None) -> M
 def _clean_store():
     """Clear captcha store between tests."""
     store._pending.clear()
-    store._verified.clear()
+    store._verified_cache.clear()
+    store._db.execute("DELETE FROM verified")
+    store._db.commit()
     yield
     store._pending.clear()
-    store._verified.clear()
+    store._verified_cache.clear()
+    store._db.execute("DELETE FROM verified")
+    store._db.commit()
 
 
 class TestOnUserJoined:
