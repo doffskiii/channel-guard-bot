@@ -16,7 +16,7 @@ EMOJI_POOL = [
 ]
 
 # Messages — tone: вежливый но твёрдый фейсконтрольщик
-MSG_CAPTCHA = "{mention}, добрый вечер. Нажми на {emoji}, пожалуйста. У тебя {timeout} секунд."
+MSG_CAPTCHA = "{mention}, привет. Нажми на {emoji}, пожалуйста. У тебя {timeout} секунд."
 MSG_WELCOME = "{mention}, проходи. Веди себя ровно."
 MSG_KICKED = "{mention}, к сожалению сегодня пройти не получится."
 MSG_WRONG = "Не то. Попробуй ещё раз."

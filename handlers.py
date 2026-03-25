@@ -95,27 +95,15 @@ async def _timeout_handler(bot: Bot, chat_id: int, user_id: int) -> None:
     _timeout_tasks.pop((chat_id, user_id), None)
 
 
-# --- Handler: new member joined ---
-
-
-@router.chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> MEMBER))
-async def on_user_joined(event: ChatMemberUpdated, bot: Bot) -> None:
-    user = event.new_chat_member.user
-
-    # Skip bots
-    if user.is_bot:
-        return
-
-    # Skip admins
-    if event.new_chat_member.status in (
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.CREATOR,
-    ):
-        return
-
-    chat_id = event.chat.id
-    user_id = user.id
-
+async def _send_captcha(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    user,
+    message_thread_id: int | None = None,
+    reply_to_message_id: int | None = None,
+) -> None:
+    """Create and send a captcha challenge to a user."""
     # Mute with until_date as safety net for bot crashes
     until = datetime.now(timezone.utc) + timedelta(
         seconds=CAPTCHA_TIMEOUT + RESTRICT_UNTIL_EXTRA
@@ -137,7 +125,12 @@ async def on_user_joined(event: ChatMemberUpdated, bot: Bot) -> None:
     )
 
     msg = await bot.send_message(
-        chat_id, text, reply_markup=keyboard, parse_mode="HTML"
+        chat_id,
+        text,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+        message_thread_id=message_thread_id,
+        reply_to_message_id=reply_to_message_id,
     )
     captcha.message_id = msg.message_id
 
@@ -149,6 +142,32 @@ async def on_user_joined(event: ChatMemberUpdated, bot: Bot) -> None:
     # Start timeout
     task = asyncio.create_task(_timeout_handler(bot, chat_id, user_id))
     _timeout_tasks[(chat_id, user_id)] = task
+
+
+# --- Handler: new member joined (explicit join button) ---
+
+
+@router.chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> MEMBER))
+async def on_user_joined(event: ChatMemberUpdated, bot: Bot) -> None:
+    user = event.new_chat_member.user
+
+    # Skip bots
+    if user.is_bot:
+        return
+
+    # Skip admins
+    if event.new_chat_member.status in (
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.CREATOR,
+    ):
+        store.verify(event.chat.id, user.id)
+        return
+
+    # Already verified (e.g. passed captcha via comment before joining)
+    if store.is_verified(event.chat.id, user.id):
+        return
+
+    await _send_captcha(bot, event.chat.id, user.id, user)
 
 
 # --- Handler: captcha button pressed ---
@@ -187,6 +206,7 @@ async def on_captcha_button(callback: CallbackQuery, bot: Bot) -> None:
 
     # Correct! Remove captcha and unmute
     store.remove(chat_id, target_user_id)
+    store.verify(chat_id, target_user_id)
 
     # Cancel timeout task
     task = _timeout_tasks.pop((chat_id, target_user_id), None)
@@ -224,19 +244,60 @@ async def on_captcha_button(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
 
 
-# --- Handler: delete messages from muted users (safety net) ---
+# --- Handler: intercept messages from unverified users ---
 
 
 @router.message()
-async def on_message_filter(message: Message) -> None:
+async def on_message_filter(message: Message, bot: Bot) -> None:
     if message.from_user is None:
         return
-    # Skip messages from channels (sender_chat)
+    # Skip messages from channels (sender_chat = channel posting)
     if message.sender_chat:
         return
-    captcha = store.get(message.chat.id, message.from_user.id)
-    if captcha is not None:
+    # Skip service messages (new_chat_members etc.) — join is handled by on_user_joined
+    if message.new_chat_members:
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    # Already verified — let through
+    if store.is_verified(chat_id, user_id):
+        return
+
+    # Already has pending captcha — just delete the message
+    if store.get(chat_id, user_id) is not None:
         try:
             await message.delete()
         except Exception:
             pass
+        return
+
+    # First message from unverified user — check if they're an admin
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            store.verify(chat_id, user_id)
+            return
+    except Exception:
+        logger.exception("Failed to check member status for %s", user_id)
+
+    # Not verified, not admin — delete message and send captcha in the same thread
+    logger.info(
+        "Unverified user %s sent message in %s thread=%s — triggering captcha",
+        user_id, chat_id, message.message_thread_id,
+    )
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Send captcha in the same comment thread by replying to the forwarded post
+    await _send_captcha(
+        bot,
+        chat_id,
+        user_id,
+        message.from_user,
+        message_thread_id=message.message_thread_id,
+        reply_to_message_id=message.message_thread_id,
+    )

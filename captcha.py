@@ -1,10 +1,14 @@
 import random
+import sqlite3
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import EMOJI_GRID_SIZE, EMOJI_POOL
+
+DB_PATH = Path(__file__).parent / "data" / "guard.db"
 
 
 @dataclass
@@ -17,13 +21,32 @@ class PendingCaptcha:
 
 
 class CaptchaStore:
-    """In-memory store for pending captcha challenges."""
+    """SQLite-backed store for verified users, in-memory for pending captchas."""
 
     def __init__(self) -> None:
         self._pending: dict[tuple[int, int], PendingCaptcha] = {}  # (chat_id, user_id)
+        self._db = self._init_db()
+        self._verified_cache: set[tuple[int, int]] = self._load_verified()
+
+    def _init_db(self) -> sqlite3.Connection:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS verified (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                verified_at REAL NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
+            )"""
+        )
+        conn.commit()
+        return conn
+
+    def _load_verified(self) -> set[tuple[int, int]]:
+        rows = self._db.execute("SELECT chat_id, user_id FROM verified").fetchall()
+        return {(r[0], r[1]) for r in rows}
 
     def create(self, chat_id: int, user_id: int) -> PendingCaptcha:
-        # Clear old entry if exists (e.g. user rejoined)
         self.remove(chat_id, user_id)
         correct = random.choice(EMOJI_POOL)
         captcha = PendingCaptcha(user_id=user_id, chat_id=chat_id, correct_emoji=correct)
@@ -38,6 +61,25 @@ class CaptchaStore:
 
     def all_pending(self) -> list[PendingCaptcha]:
         return list(self._pending.values())
+
+    def verify(self, chat_id: int, user_id: int) -> None:
+        self._verified_cache.add((chat_id, user_id))
+        self._db.execute(
+            "INSERT OR IGNORE INTO verified (chat_id, user_id, verified_at) VALUES (?, ?, ?)",
+            (chat_id, user_id, time.time()),
+        )
+        self._db.commit()
+
+    def is_verified(self, chat_id: int, user_id: int) -> bool:
+        return (chat_id, user_id) in self._verified_cache
+
+    def unverify(self, chat_id: int, user_id: int) -> None:
+        self._verified_cache.discard((chat_id, user_id))
+        self._db.execute(
+            "DELETE FROM verified WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
+        )
+        self._db.commit()
 
 
 def build_keyboard(captcha: PendingCaptcha) -> InlineKeyboardMarkup:
