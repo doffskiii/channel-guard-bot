@@ -110,7 +110,7 @@ class TestOnCaptchaButton:
         bot = AsyncMock()
         await on_captcha_button(cb, bot)
         cb.answer.assert_called_once()
-        assert "не для тебя" in cb.answer.call_args[0][0]
+        assert "не твоя тема" in cb.answer.call_args[0][0]
         # User should still be pending
         assert store.get(10, 200) is not None
 
