@@ -145,7 +145,8 @@ class TestOnCaptchaButton:
         bot.restrict_chat_member.assert_called_once()
         assert store.get(10, 200) is None
         assert store.is_verified(10, 200)
-        cb.message.delete.assert_called_once()
+        # Captcha message deleted via bot.delete_message (not cb.message.delete)
+        bot.delete_message.assert_called_once_with(10, cb.message.message_id)
 
 
 class TestOnMessageFilter:
@@ -163,7 +164,8 @@ class TestOnMessageFilter:
         msg = _make_message(user_id=200, chat_id=10)
         bot = AsyncMock()
         await on_message_filter(msg, bot)
-        msg.delete.assert_called_once()
+        # Extra messages from pending users deleted via bot.delete_message
+        bot.delete_message.assert_called_once_with(10, msg.message_id)
         # Should not create a second captcha
         bot.send_message.assert_not_called()
 
@@ -179,8 +181,8 @@ class TestOnMessageFilter:
 
         await on_message_filter(msg, bot)
 
-        # Message should be deleted
-        msg.delete.assert_called_once()
+        # Message is NOT deleted immediately — kept while captcha is pending (deferred deletion)
+        msg.delete.assert_not_called()
         # User should be restricted
         bot.restrict_chat_member.assert_called_once()
         # Captcha should be sent
