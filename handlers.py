@@ -170,6 +170,7 @@ async def _send_captcha(
         reply_markup=keyboard,
         parse_mode="HTML",
         message_thread_id=message_thread_id,
+        reply_to_message_id=original_message_id,
     )
     captcha.message_id = msg.message_id
 
