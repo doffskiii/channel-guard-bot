@@ -17,6 +17,8 @@ class PendingCaptcha:
     chat_id: int
     correct_emoji: str
     message_id: int | None = None
+    original_message_id: int | None = None
+    message_thread_id: int | None = None
     created_at: float = field(default_factory=time.time)
 
 

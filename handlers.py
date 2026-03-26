@@ -31,6 +31,17 @@ store = CaptchaStore()
 # Track active timeout tasks so we can cancel on successful captcha
 _timeout_tasks: dict[tuple[int, int], asyncio.Task] = {}  # type: ignore[type-arg]
 
+# Per-user locks to prevent race conditions with concurrent messages
+_user_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+def _get_lock(chat_id: int, user_id: int) -> asyncio.Lock:
+    key = (chat_id, user_id)
+    if key not in _user_locks:
+        _user_locks[key] = asyncio.Lock()
+    return _user_locks[key]
+
+
 MUTED = ChatPermissions(
     can_send_messages=False,
     can_send_audios=False,
@@ -67,6 +78,13 @@ def _mention(user) -> str:  # noqa: ANN001
     return f'<a href="tg://user?id={user.id}">{name}</a>'
 
 
+async def _delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
 async def _kick_user(bot: Bot, chat_id: int, user_id: int) -> None:
     """Kick without permanent ban — user can rejoin."""
     try:
@@ -85,12 +103,32 @@ async def _timeout_handler(bot: Bot, chat_id: int, user_id: int) -> None:
 
     # Delete captcha message
     if captcha.message_id:
-        try:
-            await bot.delete_message(chat_id, captcha.message_id)
-        except Exception:
-            pass
+        await _delete_message_safe(bot, chat_id, captcha.message_id)
+
+    # Delete original user message (was kept while captcha was pending)
+    if captcha.original_message_id:
+        await _delete_message_safe(bot, chat_id, captcha.original_message_id)
+
+    # Send kick message in the same thread (auto-delete after 10 sec)
+    mention = _mention(type("U", (), {"id": user_id, "full_name": None, "first_name": str(user_id)})())
+    try:
+        kick_msg = await bot.send_message(
+            chat_id,
+            MSG_KICKED.format(mention=mention),
+            parse_mode="HTML",
+            message_thread_id=captcha.message_thread_id,
+        )
+
+        async def _delete_kick() -> None:
+            await asyncio.sleep(10)
+            await _delete_message_safe(bot, chat_id, kick_msg.message_id)
+
+        asyncio.create_task(_delete_kick())
+    except Exception:
+        pass
 
     # Kick
+    logger.info("User %s kicked from %s — captcha timeout", user_id, chat_id)
     await _kick_user(bot, chat_id, user_id)
     _timeout_tasks.pop((chat_id, user_id), None)
 
@@ -101,7 +139,7 @@ async def _send_captcha(
     user_id: int,
     user,
     message_thread_id: int | None = None,
-    reply_to_message_id: int | None = None,
+    original_message_id: int | None = None,
 ) -> None:
     """Create and send a captcha challenge to a user."""
     # Mute with until_date as safety net for bot crashes
@@ -118,6 +156,8 @@ async def _send_captcha(
 
     # Create captcha
     captcha = store.create(chat_id, user_id)
+    captcha.original_message_id = original_message_id
+    captcha.message_thread_id = message_thread_id
     keyboard = build_keyboard(captcha)
     mention = _mention(user)
     text = MSG_CAPTCHA.format(
@@ -130,7 +170,6 @@ async def _send_captcha(
         reply_markup=keyboard,
         parse_mode="HTML",
         message_thread_id=message_thread_id,
-        reply_to_message_id=reply_to_message_id,
     )
     captcha.message_id = msg.message_id
 
@@ -194,10 +233,7 @@ async def on_captcha_button(callback: CallbackQuery, bot: Bot) -> None:
     if captcha is None:
         await callback.answer()
         # Captcha expired or already solved — clean up message
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
+        await _delete_message_safe(bot, chat_id, callback.message.message_id)
         return
 
     if emoji != captcha.correct_emoji:
@@ -207,6 +243,7 @@ async def on_captcha_button(callback: CallbackQuery, bot: Bot) -> None:
     # Correct! Remove captcha and unmute
     store.remove(chat_id, target_user_id)
     store.verify(chat_id, target_user_id)
+    logger.info("User %s verified in %s — captcha solved", target_user_id, chat_id)
 
     # Cancel timeout task
     task = _timeout_tasks.pop((chat_id, target_user_id), None)
@@ -221,26 +258,27 @@ async def on_captcha_button(callback: CallbackQuery, bot: Bot) -> None:
     except Exception:
         logger.exception("Failed to unmute user %s", target_user_id)
 
-    # Delete captcha message
+    # Delete captcha message (original user message stays)
+    await _delete_message_safe(bot, chat_id, callback.message.message_id)
+
+    # Send welcome in the same thread (auto-delete after 10 sec)
+    mention = _mention(callback.from_user)
     try:
-        await callback.message.delete()
+        welcome_msg = await bot.send_message(
+            chat_id,
+            MSG_WELCOME.format(mention=mention),
+            parse_mode="HTML",
+            message_thread_id=captcha.message_thread_id,
+        )
+
+        async def _delete_welcome() -> None:
+            await asyncio.sleep(10)
+            await _delete_message_safe(bot, chat_id, welcome_msg.message_id)
+
+        asyncio.create_task(_delete_welcome())
     except Exception:
         pass
 
-    # Send welcome (auto-delete after 10 sec)
-    mention = _mention(callback.from_user)
-    welcome_msg = await bot.send_message(
-        chat_id, MSG_WELCOME.format(mention=mention), parse_mode="HTML"
-    )
-
-    async def _delete_welcome() -> None:
-        await asyncio.sleep(10)
-        try:
-            await bot.delete_message(chat_id, welcome_msg.message_id)
-        except Exception:
-            pass
-
-    asyncio.create_task(_delete_welcome())
     await callback.answer()
 
 
@@ -265,39 +303,33 @@ async def on_message_filter(message: Message, bot: Bot) -> None:
     if store.is_verified(chat_id, user_id):
         return
 
-    # Already has pending captcha — just delete the message
-    if store.get(chat_id, user_id) is not None:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        return
-
-    # First message from unverified user — check if they're an admin
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
-            store.verify(chat_id, user_id)
+    # Use lock to prevent race condition with concurrent messages
+    async with _get_lock(chat_id, user_id):
+        # Already has pending captcha — just delete the extra message
+        if store.get(chat_id, user_id) is not None:
+            await _delete_message_safe(bot, chat_id, message.message_id)
             return
-    except Exception:
-        logger.exception("Failed to check member status for %s", user_id)
 
-    # Not verified, not admin — delete message and send captcha in the same thread
-    logger.info(
-        "Unverified user %s sent message in %s thread=%s — triggering captcha",
-        user_id, chat_id, message.message_thread_id,
-    )
-    try:
-        await message.delete()
-    except Exception:
-        pass
+        # First message from unverified user — check if they're an admin
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+                store.verify(chat_id, user_id)
+                return
+        except Exception:
+            logger.exception("Failed to check member status for %s", user_id)
 
-    # Send captcha in the same comment thread by replying to the forwarded post
-    await _send_captcha(
-        bot,
-        chat_id,
-        user_id,
-        message.from_user,
-        message_thread_id=message.message_thread_id,
-        reply_to_message_id=message.message_thread_id,
-    )
+        # Not verified, not admin — keep message, send captcha in the same thread
+        logger.info(
+            "Unverified user %s sent message in %s thread=%s — triggering captcha",
+            user_id, chat_id, message.message_thread_id,
+        )
+
+        await _send_captcha(
+            bot,
+            chat_id,
+            user_id,
+            message.from_user,
+            message_thread_id=message.message_thread_id,
+            original_message_id=message.message_id,
+        )

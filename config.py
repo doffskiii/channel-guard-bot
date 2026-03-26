@@ -3,8 +3,8 @@ import os
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # Captcha settings
-CAPTCHA_TIMEOUT = 60  # seconds to solve captcha
-RESTRICT_UNTIL_EXTRA = 30  # extra seconds for until_date safety margin
+CAPTCHA_TIMEOUT = 120  # seconds to solve captcha
+RESTRICT_UNTIL_EXTRA = 60  # extra seconds for until_date safety margin
 EMOJI_GRID_SIZE = 6  # total buttons (1 correct + 5 distractors)
 
 # Emoji pool for captcha challenges
