@@ -10,8 +10,8 @@ import pytest
 os.environ.setdefault("BOT_TOKEN", "test-token")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from aiogram.enums import ChatMemberStatus
-from handlers import on_captcha_button, on_message_filter, on_user_joined, store
+from aiogram.enums import ChatMemberStatus, ContentType
+from handlers import on_captcha_button, on_message_filter, on_service_cleanup, on_user_joined, store
 
 
 def _make_user(user_id: int = 100, is_bot: bool = False, first_name: str = "Test") -> MagicMock:
@@ -210,3 +210,21 @@ class TestOnMessageFilter:
         bot = AsyncMock()
         await on_message_filter(msg, bot)
         msg.delete.assert_not_called()
+
+
+class TestOnServiceCleanup:
+    @pytest.mark.asyncio
+    async def test_deletes_join_message(self) -> None:
+        msg = _make_message(user_id=200, chat_id=10)
+        msg.content_type = ContentType.NEW_CHAT_MEMBERS
+        bot = AsyncMock()
+        await on_service_cleanup(msg, bot)
+        bot.delete_message.assert_called_once_with(10, msg.message_id)
+
+    @pytest.mark.asyncio
+    async def test_deletes_leave_message(self) -> None:
+        msg = _make_message(user_id=200, chat_id=10)
+        msg.content_type = ContentType.LEFT_CHAT_MEMBER
+        bot = AsyncMock()
+        await on_service_cleanup(msg, bot)
+        bot.delete_message.assert_called_once_with(10, msg.message_id)

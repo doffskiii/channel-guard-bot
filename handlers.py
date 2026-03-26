@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, F, Router
-from aiogram.enums import ChatMemberStatus
+from aiogram.enums import ChatMemberStatus, ContentType
 from aiogram.filters import ChatMemberUpdatedFilter, IS_NOT_MEMBER, MEMBER
 from aiogram.types import (
     CallbackQuery,
@@ -283,6 +283,17 @@ async def on_captcha_button(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
 
 
+# --- Handler: auto-delete join/leave service messages ---
+
+_SERVICE_CLUTTER = {ContentType.NEW_CHAT_MEMBERS, ContentType.LEFT_CHAT_MEMBER}
+
+
+@router.message(F.content_type.in_(_SERVICE_CLUTTER))
+async def on_service_cleanup(message: Message, bot: Bot) -> None:
+    """Auto-delete join/leave service messages to keep chat clean."""
+    await _delete_message_safe(bot, message.chat.id, message.message_id)
+
+
 # --- Handler: intercept messages from unverified users ---
 
 
@@ -292,9 +303,6 @@ async def on_message_filter(message: Message, bot: Bot) -> None:
         return
     # Skip messages from channels (sender_chat = channel posting)
     if message.sender_chat:
-        return
-    # Skip service messages (new_chat_members etc.) — join is handled by on_user_joined
-    if message.new_chat_members:
         return
 
     chat_id = message.chat.id
